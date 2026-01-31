@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DR Demo – Hot/Warm Standby</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="min-h-screen bg-slate-950 text-slate-100">
+  <div class="max-w-5xl mx-auto p-6">
+    <header class="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+      <div>
+        <h1 class="text-3xl font-semibold tracking-tight">Disaster Recovery Demo</h1>
+        <p class="text-slate-300 mt-1">
+          PostgreSQL streaming replication + VIP failover (keepalived)
+        </p>
+      </div>
+
+      <div class="text-sm text-slate-300">
+        <div>Target (VIP): <span id="vip" class="font-mono text-slate-100">unknown</span></div>
+        <div>Last refresh: <span id="ts" class="font-mono text-slate-100">-</span></div>
+      </div>
+    </header>
+
+    <section class="grid md:grid-cols-3 gap-4 mt-6">
+      <div class="rounded-2xl bg-slate-900/60 border border-slate-800 p-4">
+        <div class="text-slate-400 text-sm">Served by node</div>
+        <div id="node" class="text-xl font-semibold mt-1">-</div>
+      </div>
+
+      <div class="rounded-2xl bg-slate-900/60 border border-slate-800 p-4">
+        <div class="text-slate-400 text-sm">Database role</div>
+        <div id="role" class="text-xl font-semibold mt-1">-</div>
+        <div id="dbhost" class="text-xs text-slate-400 mt-1 font-mono"></div>
+      </div>
+
+      <div class="rounded-2xl bg-slate-900/60 border border-slate-800 p-4">
+        <div class="text-slate-400 text-sm">Write test</div>
+        <div class="flex gap-2 mt-2">
+          <input id="note" class="w-full rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm outline-none focus:border-slate-600"
+                 placeholder="note (optional)" />
+          <button id="writeBtn"
+                  class="rounded-xl bg-indigo-500 hover:bg-indigo-400 text-slate-950 font-semibold px-4 py-2 text-sm">
+            Write
+          </button>
+        </div>
+        <div id="writeMsg" class="text-xs mt-2 text-slate-300"></div>
+      </div>
+    </section>
+
+    <section class="rounded-2xl bg-slate-900/60 border border-slate-800 p-4 mt-6">
+      <div class="flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Latest events</h2>
+        <button id="refreshBtn"
+                class="rounded-xl border border-slate-700 hover:border-slate-500 px-3 py-2 text-sm text-slate-200">
+          Refresh
+        </button>
+      </div>
+
+      <div class="overflow-x-auto mt-3">
+        <table class="w-full text-sm">
+          <thead class="text-slate-400">
+            <tr class="border-b border-slate-800">
+              <th class="text-left py-2 pr-2">ID</th>
+              <th class="text-left py-2 pr-2">Timestamp</th>
+              <th class="text-left py-2 pr-2">Node</th>
+              <th class="text-left py-2 pr-2">Note</th>
+            </tr>
+          </thead>
+          <tbody id="rows" class="align-top"></tbody>
+        </table>
+      </div>
+
+      <div id="err" class="text-xs mt-3 text-rose-300"></div>
+    </section>
+
+    <footer class="text-xs text-slate-500 mt-8">
+      Tip: Open this page via the VIP (e.g., <span class="font-mono">http://192.168.56.100:8080</span>) to watch failover live.
+    </footer>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function nowStr() {
+    return new Date().toLocaleTimeString();
+  }
+
+  function setStatusOk(msg) {
+    $("err").textContent = "";
+    if (msg) $("writeMsg").textContent = msg;
+  }
+
+  function setErr(msg) {
+    $("err").textContent = msg || "";
+  }
+
+  async function fetchJson(path, opts) {
+    const r = await fetch(path, opts);
+    const data = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, data };
+  }
+
+  async function refreshAll() {
+    $("ts").textContent = nowStr();
+    $("vip").textContent = window.location.host;
+
+    const st = await fetchJson("/status");
+    if (!st.ok) {
+      setErr(`Status failed (${st.status}): ${st.data?.error || "unknown error"}`);
+      return;
+    }
+    $("node").textContent = st.data.node || "-";
+    $("role").textContent = st.data.role || "-";
+    $("dbhost").textContent = `DB host: ${st.data.db_host || "-"}`;
+
+    const last = await fetchJson("/last?n=10");
+    if (!last.ok) {
+      setErr(`Fetch events failed (${last.status}): ${last.data?.error || "unknown error"}`);
+      return;
+    }
+
+    const rows = last.data.rows || [];
+    $("rows").innerHTML = rows.map(r => `
+      <tr class="border-b border-slate-800/70">
+        <td class="py-2 pr-2 font-mono">${r.id}</td>
+        <td class="py-2 pr-2 font-mono text-slate-300">${r.ts}</td>
+        <td class="py-2 pr-2">${r.node}</td>
+        <td class="py-2 pr-2 text-slate-300">${(r.note || "").replaceAll("<","&lt;")}</td>
+      </tr>
+    `).join("");
+
+    setStatusOk();
+  }
+
+  async function writeEvent() {
+    $("writeMsg").textContent = "Writing…";
+    const note = $("note").value || "";
+    const res = await fetchJson("/write", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({note})
+    });
+
+    if (!res.ok) {
+      // On standby before promotion, this is expected.
+      $("writeMsg").textContent = `Write failed (${res.status}). Likely standby/read-only: ${res.data?.error || ""}`;
+      return;
+    }
+
+    $("writeMsg").textContent = `OK: inserted id ${res.data.inserted_id} at ${res.data.ts}`;
+    await refreshAll();
+  }
+
+  $("refreshBtn").addEventListener("click", refreshAll);
+  $("writeBtn").addEventListener("click", writeEvent);
+
+  refreshAll();
+  setInterval(refreshAll, 1000);
+</script>
+
+</body>
+</html>
